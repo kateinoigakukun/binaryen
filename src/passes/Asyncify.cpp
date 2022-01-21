@@ -918,85 +918,150 @@ private:
     // Note that temp locals added in this way are just normal locals, and in
     // particular they are saved and loaded. That way if we resume from the
     // first if arm we will avoid the second.
-    if (auto* block = curr->dynCast<Block>()) {
-      // At least one of our children may change the state. Clump them as
-      // necessary.
-      Index i = 0;
-      auto& list = block->list;
-      while (i < list.size()) {
-        if (analyzer->canChangeState(list[i], func)) {
-          list[i] = process(list[i]);
-          i++;
-        } else {
-          Index end = i + 1;
-          while (end < list.size() &&
-                 !analyzer->canChangeState(list[end], func)) {
-            end++;
-          }
-          // We have a range of [i, end) in which the state cannot change,
-          // so all we need to do is skip it if rewinding.
-          if (end == i + 1) {
-            list[i] = makeMaybeSkip(list[i]);
-          } else {
-            auto* block = builder->makeBlock();
-            for (auto j = i; j < end; j++) {
-              block->list.push_back(list[j]);
+
+    // To avoid recursion, we use stacks here. We process the work for each
+    // node in two phases as follows:
+    //
+    //  1. The "Scan" phase finds children we need to process (ones that may
+    //     change the state), and adds Scan tasks for them to the work stack.
+    //  2. The "Finish" phase runs after all children have been Scanned and
+    //     Finished. It pops the children's results from the results stack (if
+    //     there were relevant children), and then it pushes its own result.
+    //
+    struct Work {
+      Expression* curr;
+      enum { Scan, Finish } phase;
+    };
+
+    std::vector<Work> work;
+    std::vector<Expression*> results;
+    std::unordered_set<Expression*> processed;
+
+    work.push_back(Work{curr, Work::Scan});
+
+    while (!work.empty()) {
+      auto item = work.back();
+      work.pop_back();
+      processed.insert(item.curr);
+      auto* curr = item.curr;
+      auto phase = item.phase;
+
+      if (auto* block = curr->dynCast<Block>()) {
+        auto& list = block->list;
+
+        // Find the children we need to process. They will be Scanned and
+        // Finished before we reach our own Finish phase.
+        if (phase == Work::Scan) {
+          work.push_back(Work{curr, Work::Finish});
+          for (auto* child : list) {
+            if (analyzer->canChangeState(child, func)) {
+              work.push_back(Work{child, Work::Scan});
             }
-            block->finalize();
-            list[i] = makeMaybeSkip(block);
-            for (auto j = i + 1; j < end; j++) {
-              list[j] = builder->makeNop();
-            }
           }
-          i = end;
+          continue;
         }
-      }
-      return block;
-    } else if (auto* iff = curr->dynCast<If>()) {
-      // The state change cannot be in the condition due to flat form, so it
-      // must be in one of the children.
-      assert(!analyzer->canChangeState(iff->condition, func));
-      // We must linearize this, which means we pass through both arms if we
-      // are rewinding.
-      if (!iff->ifFalse) {
+
+        // At least one of our children may change the state. Clump them as
+        // necessary.
+        Index i = 0;
+        while (i < list.size()) {
+          if (processed.count(list[i])) {
+            list[i] = results.back();
+            results.pop_back();
+            i++;
+          } else {
+            Index end = i + 1;
+            while (end < list.size() && !processed.count(list[end])) {
+              end++;
+            }
+            // We have a range of [i, end) in which the state cannot change,
+            // so all we need to do is skip it if rewinding.
+            if (end == i + 1) {
+              list[i] = makeMaybeSkip(list[i]);
+            } else {
+              auto* block = builder->makeBlock();
+              for (auto j = i; j < end; j++) {
+                block->list.push_back(list[j]);
+              }
+              block->finalize();
+              list[i] = makeMaybeSkip(block);
+              for (auto j = i + 1; j < end; j++) {
+                list[j] = builder->makeNop();
+              }
+            }
+            i = end;
+          }
+        }
+        results.push_back(block);
+        continue;
+      } else if (auto* iff = curr->dynCast<If>()) {
+        // The state change cannot be in the condition due to flat form, so it
+        // must be in one of the children.
+        assert(!analyzer->canChangeState(iff->condition, func));
+        if (item.phase == Work::Scan) {
+          work.push_back(Work{curr, Work::Finish});
+          work.push_back(Work{iff->ifTrue, Work::Scan});
+          if (iff->ifFalse) {
+            work.push_back(Work{iff->ifFalse, Work::Scan});
+          }
+          continue;
+        }
+        // We must linearize this, which means we pass through both arms if we
+        // are rewinding.
+        if (!iff->ifFalse) {
+          iff->condition = builder->makeBinary(
+            OrInt32, iff->condition, builder->makeStateCheck(State::Rewinding));
+          iff->ifTrue = results.back();
+          results.pop_back();
+          iff->finalize();
+          results.push_back(iff);
+          continue;
+        }
+        auto conditionTemp = builder->addVar(func, Type::i32);
+        // TODO: can avoid pre if the condition is a get or a const
+        auto* pre =
+          makeMaybeSkip(builder->makeLocalSet(conditionTemp, iff->condition));
+        iff->condition = builder->makeLocalGet(conditionTemp, Type::i32);
         iff->condition = builder->makeBinary(
           OrInt32, iff->condition, builder->makeStateCheck(State::Rewinding));
-        iff->ifTrue = process(iff->ifTrue);
+        iff->ifTrue = results.back();
+        results.pop_back();
+        iff->ifFalse = nullptr;
         iff->finalize();
-        return iff;
+        // Add support for the second arm as well.
+        auto* otherIf = builder->makeIf(
+          builder->makeBinary(
+            OrInt32,
+            builder->makeUnary(EqZInt32,
+                               builder->makeLocalGet(conditionTemp, Type::i32)),
+            builder->makeStateCheck(State::Rewinding)),
+          results.back());
+        results.pop_back();
+        otherIf->finalize();
+        results.push_back(builder->makeBlock({pre, iff, otherIf}));
+        continue;
+      } else if (auto* loop = curr->dynCast<Loop>()) {
+        if (item.phase == Work::Scan) {
+          work.push_back(Work{curr, Work::Finish});
+          work.push_back(Work{loop->body, Work::Scan});
+          continue;
+        }
+        loop->body = results.back();
+        results.pop_back();
+        results.push_back(loop);
+        continue;
+      } else if (doesCall(curr)) {
+        results.push_back(makeCallSupport(curr));
+        continue;
       }
-      auto conditionTemp = builder->addVar(func, Type::i32);
-      // TODO: can avoid pre if the condition is a get or a const
-      auto* pre =
-        makeMaybeSkip(builder->makeLocalSet(conditionTemp, iff->condition));
-      iff->condition = builder->makeLocalGet(conditionTemp, Type::i32);
-      iff->condition = builder->makeBinary(
-        OrInt32, iff->condition, builder->makeStateCheck(State::Rewinding));
-      iff->ifTrue = process(iff->ifTrue);
-      auto* otherArm = iff->ifFalse;
-      iff->ifFalse = nullptr;
-      iff->finalize();
-      // Add support for the second arm as well.
-      auto* otherIf = builder->makeIf(
-        builder->makeBinary(
-          OrInt32,
-          builder->makeUnary(EqZInt32,
-                             builder->makeLocalGet(conditionTemp, Type::i32)),
-          builder->makeStateCheck(State::Rewinding)),
-        process(otherArm));
-      otherIf->finalize();
-      return builder->makeBlock({pre, iff, otherIf});
-    } else if (auto* loop = curr->dynCast<Loop>()) {
-      loop->body = process(loop->body);
-      return loop;
-    } else if (doesCall(curr)) {
-      return makeCallSupport(curr);
+      // We must handle all control flow above, and all things that can change
+      // the state, so there should be nothing that can reach here - add it
+      // earlier as necessary.
+      // std::cout << *curr << '\n';
+      WASM_UNREACHABLE("unexpected expression type");
     }
-    // We must handle all control flow above, and all things that can change
-    // the state, so there should be nothing that can reach here - add it
-    // earlier as necessary.
-    // std::cout << *curr << '\n';
-    WASM_UNREACHABLE("unexpected expression type");
+    assert(results.size() == 1);
+    return results.back();
   }
 
   // Possibly skip some code, if rewinding.
