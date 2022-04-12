@@ -151,7 +151,7 @@ struct EquivalentClass {
   EquivalentClass(Function* primaryFunction, std::vector<Function*> functions)
     : primaryFunction(primaryFunction), functions(functions) {}
 
-  bool isEligibleToMerge() { return this->functions.size() == 2; }
+  bool isEligibleToMerge() { return this->functions.size() >= 2; }
 
   // Merge the functions in this class.
   void merge(Module* module, const std::vector<ParamInfo>& params);
