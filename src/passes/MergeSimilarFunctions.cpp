@@ -322,6 +322,9 @@ void MergeSimilarFunctions::collectEquivalentClasses(
       auto* func = hashGroup[i];
       bool found = false;
       for (auto& newClass : classesInGroup) {
+        if (newClass.functions.size() >= 2) {
+          continue;
+        }
         if (areInEquvalentClass(newClass.primaryFunction, func, module)) {
           newClass.functions.push_back(func);
           found = true;
